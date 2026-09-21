@@ -8,12 +8,247 @@ import "android.media.*"
 import "android.media.audiofx.*"
 import "android.provider.*"
 import "android.net.*"
+import "com.androlua.Http"
+import "com.androlua.LuaDialog"
 import "java.io.File"
 import "java.io.FileInputStream"
 import "java.io.FileOutputStream"
 import "java.lang.Thread"
 import "java.lang.Runnable"
 import "java.lang.Math"
+import "java.lang.System"
+
+local CURRENT_VERSION = "1.0"
+local VERSION_URL = "https://raw.githubusercontent.com/hafizshanmemon116-cmyk/Audio-Player-Pro/main/version.txt"
+local UPDATE_CODE_URL = "https://raw.githubusercontent.com/hafizshanmemon116-cmyk/Audio-Player-Pro/main/main.lua"
+local PLUGIN_PATH = (function()
+    local src = debug.getinfo(1, "S").source
+    return src and src:match("^@?(.*)$") or ""
+end)()
+local updateInProgress = false
+
+local autoUpdatePrefs = (service or activity or this).getSharedPreferences("AutoUpdatePrefs", Context.MODE_PRIVATE)
+
+local function playNotification()
+    pcall(function()
+        local tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
+        tone.startTone(ToneGenerator.TONE_PROP_ACK, 100)
+        local vibrator = (service or activity or this).getSystemService(Context.VIBRATOR_SERVICE)
+        if vibrator then
+            if Build.VERSION.SDK_INT >= 26 then
+                vibrator.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
+            else
+                vibrator.vibrate(200)
+            end
+        end
+    end)
+end
+
+local function trim(s)
+    if s == nil then return "" end
+    return tostring(s):gsub("^%s*(.-)%s*$", "%1")
+end
+
+local function showUpdateErrorDialog(title, message)
+    Handler(Looper.getMainLooper()).post(Runnable({
+        run = function()
+            local errorDialog = LuaDialog(service or activity or this)
+            errorDialog.setTitle(title)
+            errorDialog.setMessage(message)
+            errorDialog.setButton("OK", function()
+                errorDialog.dismiss()
+            end)
+            errorDialog.show()
+        end
+    }))
+end
+
+local function checkAndShowNewFeatures()
+    local lastShown = autoUpdatePrefs.getString("lastShownVersion", "")
+    if lastShown ~= CURRENT_VERSION then
+        Handler(Looper.getMainLooper()).post(Runnable{
+            run=function()
+                playNotification()
+                local featuresDialog = LuaDialog(service or activity or this)
+                featuresDialog.setTitle("New Update Details")
+                featuresDialog.setMessage("Audio Player Pro Advanced Guide\n\n1. Files & Folders View:\n- Browse all audio files or folders.\n\n2. Audio Controls & Main Dialog:\n- Interactive Visualizer & Waveform Bar.\n- Playback Speed (0.5x - 2.0x).\n- A-B Loop functionality for repeating segments.\n- Voice Booster & Bookmarks with timestamp notes.\n- Subtitles & Lyrics display support.\n\n3. Settings & Smart Features:\n- Advanced Equalizer & Sound Presets.\n- Smart Sleep Timer & Gapless Playback.\n- Skip Silence & AI Noise Reduction.\n- Crossfade Fade In / Fade Out.\n- Audio Trimmer & ID3 Tag Editor.\n\nDeveloper: Jahanzaib")
+                featuresDialog.setButton("OK", function() 
+                    featuresDialog.dismiss() 
+                end)
+                featuresDialog.show()
+                autoUpdatePrefs.edit().putString("lastShownVersion", CURRENT_VERSION).apply()
+            end
+        })
+    end
+end
+
+local function performUpdate(mainCode, onlineVersion)
+    if not mainCode or trim(mainCode) == "" then
+        showUpdateErrorDialog("Update Failed", "Main plugin code is empty.")
+        return
+    end
+    
+    updateInProgress = true
+    
+    local function updateProcess()
+        local currentFileSrc = debug.getinfo(1, "S").source
+        local currentFilePath = currentFileSrc and currentFileSrc:match("^@?(.*)$") or ""
+        
+        if currentFilePath ~= "" and currentFilePath ~= PLUGIN_PATH then
+            pcall(function()
+                os.rename(currentFilePath, PLUGIN_PATH)
+            end)
+        end
+        
+        local success = false
+        local tempPath = PLUGIN_PATH .. ".temp_update"
+        local f = io.open(tempPath, "w")
+        if f then
+            f:write(mainCode)
+            f:close()
+            
+            local fileExists = io.open(PLUGIN_PATH, "r")
+            if fileExists then
+                fileExists:close()
+                local delSuccess = pcall(function()
+                    os.remove(PLUGIN_PATH)
+                end)
+                if delSuccess then
+                    local renameSuccess = pcall(function()
+                        os.rename(tempPath, PLUGIN_PATH)
+                    end)
+                    if renameSuccess then
+                        success = true
+                    end
+                end
+            else
+                local renameSuccess = pcall(function()
+                    os.rename(tempPath, PLUGIN_PATH)
+                end)
+                if renameSuccess then
+                    success = true
+                end
+            end
+            
+            if not success then
+                pcall(function() os.remove(tempPath) end)
+            end
+        end
+        
+        if success then
+            updateInProgress = false
+            Handler(Looper.getMainLooper()).post(Runnable({
+                run = function()
+                    playNotification()
+                    local successDialog = LuaDialog(service or activity or this)
+                    successDialog.setTitle("Update Successful")
+                    successDialog.setMessage("Successfully updated to the latest version.\n\nClick OK to restart and apply the update.")
+                    successDialog.setButton("OK", function()
+                        successDialog.dismiss()
+                        autoUpdatePrefs.edit().remove("lastShownVersion").apply()
+                        
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function()
+                                pcall(function() if _G.mainDialog then _G.mainDialog.dismiss() _G.mainDialog = nil end end)
+                                pcall(function() if _G.mainDlg then _G.mainDlg.dismiss() _G.mainDlg = nil end end)
+                                pcall(function() if _G.allDialogBox then _G.allDialogBox.dismiss() _G.allDialogBox = nil end end)
+                                pcall(function() if _G.alertDialogBox then _G.alertDialogBox.dismiss() _G.alertDialogBox = nil end end)
+                                
+                                pcall(function() if _G.dismissAllDialogs then _G.dismissAllDialogs() end end)
+                                pcall(function() if _G.dismissAll then _G.dismissAll() end end)
+                                pcall(function() if _G.dismiss then _G.dismiss() end end)
+                                pcall(function() if dismissAllDialogs then dismissAllDialogs() end end)
+                                pcall(function() if dismissAll then dismissAll() end end)
+                                
+                                pcall(function()
+                                    if activity then
+                                        activity.finish()
+                                    end
+                                end)
+                            end
+                        }))
+                        
+                        Handler(Looper.getMainLooper()).postDelayed(Runnable({
+                            run = function()
+                                local pluginFile = io.open(PLUGIN_PATH, "r")
+                                if pluginFile then
+                                    pluginFile:close()
+                                    local func, err = loadfile(PLUGIN_PATH)
+                                    if func then
+                                        pcall(func)
+                                    else
+                                        Toast.makeText(service or activity or this, "Error reloading plugin: " .. tostring(err), Toast.LENGTH_SHORT).show()
+                                    end
+                                end
+                            end
+                        }), 1000)
+                    end)
+                    successDialog.show()
+                end
+            }))
+            return
+        else
+            updateInProgress = false
+            showUpdateErrorDialog("Update Failed", "Update failed. Please try again.")
+        end
+    end
+    
+    local updateThread = Thread(Runnable{
+        run = updateProcess
+    })
+    updateThread.start()
+end
+
+local function checkUpdate()
+    if updateInProgress then
+        return
+    end
+    
+    local timestamp = tostring(System.currentTimeMillis())
+    Http.get(VERSION_URL .. "?t=" .. timestamp, function(code, response)
+        if code == 200 and response then
+            local onlineVersion = trim(response)
+            if onlineVersion ~= CURRENT_VERSION then
+                Http.get(UPDATE_CODE_URL .. "?t=" .. timestamp, function(code2, mainCode)
+                    if code2 == 200 and mainCode and trim(mainCode) ~= "" then
+                        Handler(Looper.getMainLooper()).post(Runnable({
+                            run = function()
+                                playNotification()
+                                local updateAlertDlg = LuaDialog(service or activity or this)
+                                updateAlertDlg.setTitle("Update Available!")
+                                updateAlertDlg.setMessage("A new version (" .. onlineVersion .. ") is available.\nCurrent version: " .. CURRENT_VERSION .. "\n\nWould you like to update now?")
+                                updateAlertDlg.setButton("Update Now", function()
+                                    updateAlertDlg.dismiss()
+                                    Toast.makeText(service or activity or this, "Downloading update...", Toast.LENGTH_SHORT).show()
+                                    performUpdate(mainCode, onlineVersion)
+                                end)
+                                updateAlertDlg.setButton2("Later", function()
+                                    updateAlertDlg.dismiss()
+                                    checkAndShowNewFeatures()
+                                end)
+                                updateAlertDlg.show()
+                            end
+                        }))
+                    else
+                        checkAndShowNewFeatures()
+                    end
+                end)
+            else
+                checkAndShowNewFeatures()
+            end
+        else
+            checkAndShowNewFeatures()
+        end
+    end)
+end
+
+checkAndShowNewFeatures()
+
+Handler(Looper.getMainLooper()).postDelayed(Runnable({
+    run = function()
+        checkUpdate()
+    end
+}), 1500)
 
 local ctx = activity or service or this
 if not ctx then
@@ -270,6 +505,15 @@ local timeCurrent = nil
 local timeTotal = nil
 local btnPlayPause = nil
 local lyricsView = nil
+local btnFavControl = nil
+
+local function updateFavButtonState()
+  if btnFavControl and currentIndex ~= -1 and activeList[currentIndex] then
+    local item = activeList[currentIndex]
+    local isFav = favoriteFiles[item.path] or false
+    btnFavControl.setText(isFav and "Remove Favorite" or "Add Favorite")
+  end
+end
 
 local function showPlayerDialog()
   if playerDialog then return end
@@ -363,6 +607,9 @@ local function showPlayerDialog()
   local btnViewBookmarks = createControlButton("View Bookmarks")
   row3.addView(btnViewBookmarks)
 
+  btnFavControl = createControlButton("Add Favorite")
+  row3.addView(btnFavControl)
+
   layout.addView(row3)
 
   lyricsView = TextView(ctx)
@@ -373,12 +620,15 @@ local function showPlayerDialog()
   lyricsView.setTextColor(0xFF757575)
   layout.addView(lyricsView)
 
+  updateFavButtonState()
+
   local builder = AlertDialog.Builder(ctx)
   builder.setTitle("Audio Player Main Controls")
   builder.setView(scrollView)
   builder.setPositiveButton("Go Back", DialogInterface.OnClickListener{
     onClick = function(d, w)
       playerDialog = nil
+      btnFavControl = nil
     end
   })
 
@@ -558,6 +808,28 @@ local function showPlayerDialog()
       end
     end
   })
+
+  btnFavControl.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if currentIndex ~= -1 and activeList[currentIndex] then
+        local item = activeList[currentIndex]
+        local isFav = favoriteFiles[item.path] or false
+        if isFav then
+          favoriteFiles[item.path] = nil
+          saveHiddenList("favoriteFiles", favoriteFiles)
+          Toast.makeText(ctx, "Removed from Favorites!", Toast.LENGTH_SHORT).show()
+        else
+          favoriteFiles[item.path] = true
+          saveHiddenList("favoriteFiles", favoriteFiles)
+          Toast.makeText(ctx, "Added to Favorites!", Toast.LENGTH_SHORT).show()
+        end
+        updateFavButtonState()
+        if _G.refreshExplorerCurrentList then
+          _G.refreshExplorerCurrentList()
+        end
+      end
+    end
+  })
 end
 
 function playAudioAtIndex(index)
@@ -580,6 +852,7 @@ function playAudioAtIndex(index)
     if seekBar then seekBar.setMax(mediaPlayer.getDuration()) end
     if timeTotal then timeTotal.setText(formatDuration(mediaPlayer.getDuration())) end
     if lyricsView then lyricsView.setText("Now Playing: " .. item.name .. "\n(Lyrics / Subtitles ready)") end
+    updateFavButtonState()
 
     prefs.edit().putString("lastPlayingPath", item.path).apply()
   end)
@@ -879,11 +1152,13 @@ local function showActionDialog(item, isFolderMode, isHiddenMode, onComplete, cu
         favoriteFiles[item.path] = true
         saveHiddenList("favoriteFiles", favoriteFiles)
         Toast.makeText(ctx, "Added to Favorites!", Toast.LENGTH_SHORT).show()
+        updateFavButtonState()
         if onComplete then onComplete() end
       elseif selectedOption == "Remove from Favorites" then
         favoriteFiles[item.path] = nil
         saveHiddenList("favoriteFiles", favoriteFiles)
         Toast.makeText(ctx, "Removed from Favorites!", Toast.LENGTH_SHORT).show()
+        updateFavButtonState()
         if onComplete then onComplete() end
       end
     end
@@ -1015,6 +1290,8 @@ openExplorerDialog = function(isFolderMode, folderPath, isHiddenMode, isFavMode)
     end
     refreshDialogList()
   end
+
+  _G.refreshExplorerCurrentList = filterAndRefresh
 
   btnSearchQuery.setOnClickListener(View.OnClickListener{
     onClick = function(v)
@@ -1226,7 +1503,7 @@ local function openSettings()
   layout.addView(chkFade)
 
   local btnShowFavorites = Button(ctx)
-  btnShowFavorites.setText("Show Favorites")
+  btnShowFavorites.setText("Favorites")
   btnShowFavorites.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
   btnShowFavorites.setOnClickListener(View.OnClickListener{
     onClick = function(v)
@@ -1263,7 +1540,7 @@ local function openSettings()
       if selectedPos == 0 then skipDuration = 10000
       elseif selectedPos == 1 then skipDuration = 20000
       elseif selectedPos == 2 then skipDuration = 30000
-      elseif selectedPos == 3 then skipDuration = 60000 end
+      elseif selectedPos == 60000 then skipDuration = 60000 end
 
       backgroundPlay = chkBgPlay.isChecked()
       singleLoop = chkSingleLoop.isChecked()
