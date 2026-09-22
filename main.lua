@@ -22,17 +22,13 @@ if not ctx then
 end
 
 local mainHandler = Handler(Looper.getMainLooper())
-local prefs = ctx.getSharedPreferences("AudioPlayerProPrefs", Context.MODE_PRIVATE)
+local prefs = ctx.getSharedPreferences("MediaPlayerProPrefs", Context.MODE_PRIVATE)
 
 local skipDuration = prefs.getInt("skipDuration", 10000)
 local backgroundPlay = prefs.getBoolean("backgroundPlay", false)
 local singleLoop = prefs.getBoolean("singleLoop", false)
-
-local gaplessPlay = prefs.getBoolean("gaplessPlay", false)
-local skipSilence = prefs.getBoolean("skipSilence", false)
-local noiseReduction = prefs.getBoolean("noiseReduction", false)
-local fadeEffect = prefs.getBoolean("fadeEffect", false)
-local eqPreset = prefs.getString("eqPreset", "Normal")
+local playbackSpeed = prefs.getFloat("playbackSpeed", 1.0)
+local lastPlayingPath = prefs.getString("lastPlayingPath", "")
 
 local function getHiddenList(key)
   local str = prefs.getString(key, "")
@@ -57,12 +53,12 @@ local hiddenFiles = getHiddenList("hiddenFiles")
 local hiddenFolders = getHiddenList("hiddenFolders")
 local favoriteFiles = getHiddenList("favoriteFiles")
 
-if not _G.GlobalAudioPlayer then
-  _G.GlobalAudioPlayer = MediaPlayer()
+if not _G.GlobalMediaPlayer then
+  _G.GlobalMediaPlayer = MediaPlayer()
 end
-local mediaPlayer = _G.GlobalAudioPlayer
+local mediaPlayer = _G.GlobalMediaPlayer
 
-local audioList = {}
+local mediaList = {}
 local folderList = {}
 local activeList = {}
 local currentIndex = -1
@@ -76,11 +72,41 @@ local abLoopStart = -1
 local abLoopEnd = -1
 local isABLoopActive = false
 
-local sleepTimerHandler = Handler(Looper.getMainLooper())
-local sleepTimerRunnable = nil
+local function isVideoFile(fileName)
+  if not fileName then return false end
+  local ext = fileName:match("%.([^%.]+)$")
+  if ext then
+    ext = ext:lower()
+    if ext == "mp4" or ext == "mkv" or ext == "webm" or ext == "3gp" or ext == "avi" or ext == "flv" or ext == "mov" then
+      return true
+    end
+  end
+  return false
+end
+
+local function isAudioFile(fileName)
+  if not fileName then return false end
+  local ext = fileName:match("%.([^%.]+)$")
+  if ext then
+    ext = ext:lower()
+    if ext == "mp3" or ext == "m4a" or ext == "wav" or ext == "aac" or ext == "ogg" or ext == "flac" or ext == "opus" or ext == "amr" then
+      return true
+    end
+  end
+  return false
+end
+
+local function isMediaFile(fileName)
+  return isVideoFile(fileName) or isAudioFile(fileName)
+end
 
 local function showSafeDialog(builder)
-  local dlg = builder.create()
+  local dlg
+  if builder.create then
+    dlg = builder.create()
+  else
+    dlg = builder
+  end
   if not activity then
     pcall(function()
       local winType = WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
@@ -160,48 +186,29 @@ local function deleteDirectoryRaw(f)
   f.delete()
 end
 
-local function createVisualizerView()
-  local visLayout = LinearLayout(ctx)
-  visLayout.setOrientation(LinearLayout.HORIZONTAL)
-  visLayout.setGravity(Gravity.CENTER)
-  visLayout.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 80))
-  visLayout.setPadding(0, 10, 0, 10)
-
-  local bars = {}
-  for i = 1, 15 do
-    local bar = View(ctx)
-    local params = LinearLayout.LayoutParams(10, 30)
-    params.setMargins(4, 0, 4, 0)
-    bar.setLayoutParams(params)
-    bar.setBackgroundColor(0xFF1E88E5)
-    visLayout.addView(bar)
-    table.insert(bars, bar)
-  end
-
-  local visHandler = Handler(Looper.getMainLooper())
-  local visRunnable
-  visRunnable = Runnable{
-    run = function()
-      if mediaPlayer and mediaPlayer.isPlaying() then
-        for _, bar in ipairs(bars) do
-          local h = math.random(15, 75)
-          local params = bar.getLayoutParams()
-          params.height = h
-          bar.setLayoutParams(params)
-        end
-      else
-        for _, bar in ipairs(bars) do
-          local params = bar.getLayoutParams()
-          params.height = 15
-          bar.setLayoutParams(params)
-        end
+local function applyPlaybackSpeed()
+  if Build.VERSION.SDK_INT >= 23 and mediaPlayer then
+    pcall(function()
+      local PlaybackParamsClass = luajava.bindClass("android.media.PlaybackParams")
+      local params = mediaPlayer.getPlaybackParams()
+      if not params then
+        params = PlaybackParamsClass()
       end
-      visHandler.postDelayed(visRunnable, 150)
-    end
-  }
-  visHandler.post(visRunnable)
-  return visLayout
+      params.setSpeed(playbackSpeed)
+      local wasPlaying = mediaPlayer.isPlaying()
+      mediaPlayer.setPlaybackParams(params)
+      if not wasPlaying then
+        mediaPlayer.pause()
+      end
+    end)
+  end
 end
+
+local openExplorerDialog
+local openDedicatedVideoPlayer
+local playMediaAtIndex
+local showPlayerDialog
+local showOperationDialog
 
 local mainLayout = LinearLayout(ctx)
 mainLayout.setOrientation(LinearLayout.VERTICAL)
@@ -209,7 +216,7 @@ mainLayout.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.M
 mainLayout.setPadding(16, 16, 16, 16)
 
 local titleView = TextView(ctx)
-titleView.setText("Audio Player Pro")
+titleView.setText("Media Player Pro")
 titleView.setTextSize(22)
 titleView.setTextColor(0xFF1E88E5)
 titleView.setGravity(Gravity.CENTER)
@@ -222,15 +229,15 @@ devView.setGravity(Gravity.CENTER)
 devView.setPadding(0, 0, 0, 15)
 mainLayout.addView(devView)
 
-local btnShowFiles = Button(ctx)
-btnShowFiles.setText("Files (Loading...)")
-btnShowFiles.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-mainLayout.addView(btnShowFiles)
+local btnAudioPlayer = Button(ctx)
+btnAudioPlayer.setText("Audio Player")
+btnAudioPlayer.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+mainLayout.addView(btnAudioPlayer)
 
-local btnShowFolders = Button(ctx)
-btnShowFolders.setText("Folders (Loading...)")
-btnShowFolders.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-mainLayout.addView(btnShowFolders)
+local btnVideoPlayerMain = Button(ctx)
+btnVideoPlayerMain.setText("Video Player")
+btnVideoPlayerMain.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+mainLayout.addView(btnVideoPlayerMain)
 
 local bottomLayout = LinearLayout(ctx)
 bottomLayout.setOrientation(LinearLayout.VERTICAL)
@@ -263,6 +270,92 @@ else
   mainDialog = showSafeDialog(mainBuilder)
 end
 
+local function showAudioPlayerMenu()
+  local audioLayout = LinearLayout(ctx)
+  audioLayout.setOrientation(LinearLayout.VERTICAL)
+  audioLayout.setPadding(20, 20, 20, 20)
+
+  local btnAudioFiles = Button(ctx)
+  btnAudioFiles.setText("All Audio Files")
+  btnAudioFiles.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+  audioLayout.addView(btnAudioFiles)
+
+  local btnAudioFolders = Button(ctx)
+  btnAudioFolders.setText("Audio Folders")
+  btnAudioFolders.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+  audioLayout.addView(btnAudioFolders)
+
+  local builder = AlertDialog.Builder(ctx)
+  builder.setTitle("Audio Player")
+  builder.setView(audioLayout)
+  builder.setPositiveButton("Go Back", nil)
+
+  local audioMenuDlg = showSafeDialog(builder)
+
+  btnAudioFiles.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      audioMenuDlg.dismiss()
+      openExplorerDialog(false, nil, false, false, "audio")
+    end
+  })
+
+  btnAudioFolders.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      audioMenuDlg.dismiss()
+      openExplorerDialog(true, nil, false, false, "audio")
+    end
+  })
+end
+
+local function showVideoPlayerMenu()
+  local videoLayout = LinearLayout(ctx)
+  videoLayout.setOrientation(LinearLayout.VERTICAL)
+  videoLayout.setPadding(20, 20, 20, 20)
+
+  local btnVideoFiles = Button(ctx)
+  btnVideoFiles.setText("All Video Files")
+  btnVideoFiles.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+  videoLayout.addView(btnVideoFiles)
+
+  local btnVideoFolders = Button(ctx)
+  btnVideoFolders.setText("Video Folders")
+  btnVideoFolders.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+  videoLayout.addView(btnVideoFolders)
+
+  local builder = AlertDialog.Builder(ctx)
+  builder.setTitle("Video Player")
+  builder.setView(videoLayout)
+  builder.setPositiveButton("Go Back", nil)
+
+  local videoMenuDlg = showSafeDialog(builder)
+
+  btnVideoFiles.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      videoMenuDlg.dismiss()
+      openExplorerDialog(false, nil, false, false, "video")
+    end
+  })
+
+  btnVideoFolders.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      videoMenuDlg.dismiss()
+      openExplorerDialog(true, nil, false, false, "video")
+    end
+  })
+end
+
+btnAudioPlayer.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    showAudioPlayerMenu()
+  end
+})
+
+btnVideoPlayerMain.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    showVideoPlayerMenu()
+  end
+})
+
 local playerDialog = nil
 local trackStatusView = nil
 local seekBar = nil
@@ -281,13 +374,11 @@ local function showPlayerDialog()
   scrollView.addView(layout)
 
   trackStatusView = TextView(ctx)
-  trackStatusView.setText("No Audio Playing")
+  trackStatusView.setText("No Media Playing")
   trackStatusView.setTextSize(16)
   trackStatusView.setGravity(Gravity.CENTER)
   trackStatusView.setPadding(0, 8, 0, 8)
   layout.addView(trackStatusView)
-
-  layout.addView(createVisualizerView())
 
   local seekBarLayout = LinearLayout(ctx)
   seekBarLayout.setOrientation(LinearLayout.HORIZONTAL)
@@ -343,16 +434,28 @@ local function showPlayerDialog()
   row2.setOrientation(LinearLayout.HORIZONTAL)
   row2.setPadding(0, 10, 0, 10)
 
-  local btnSpeed = createControlButton("Speed: 1.0x")
+  local btnSpeed = createControlButton("Speed: " .. tostring(playbackSpeed) .. "x")
   row2.addView(btnSpeed)
 
   local btnABLoop = createControlButton("Set A-B Loop")
   row2.addView(btnABLoop)
 
-  local btnVoiceBoost = createControlButton("Voice Boost: OFF")
-  row2.addView(btnVoiceBoost)
+  local btnFullscreen = createControlButton("Video Fullscreen")
+  row2.addView(btnFullscreen)
 
   layout.addView(row2)
+
+  local rowCopyMove = LinearLayout(ctx)
+  rowCopyMove.setOrientation(LinearLayout.HORIZONTAL)
+  rowCopyMove.setPadding(0, 5, 0, 5)
+
+  local btnAudioCopy = createControlButton("Copy")
+  rowCopyMove.addView(btnAudioCopy)
+
+  local btnAudioMove = createControlButton("Move")
+  rowCopyMove.addView(btnAudioMove)
+
+  layout.addView(rowCopyMove)
 
   local row3 = LinearLayout(ctx)
   row3.setOrientation(LinearLayout.HORIZONTAL)
@@ -363,10 +466,13 @@ local function showPlayerDialog()
   local btnViewBookmarks = createControlButton("View Bookmarks")
   row3.addView(btnViewBookmarks)
 
+  local btnFavoriteToggle = createControlButton("Favorite")
+  row3.addView(btnFavoriteToggle)
+
   layout.addView(row3)
 
   lyricsView = TextView(ctx)
-  lyricsView.setText("Live Lyrics / Subtitles Display Mode")
+  lyricsView.setText("Live Info Display")
   lyricsView.setTextSize(12)
   lyricsView.setGravity(Gravity.CENTER)
   lyricsView.setPadding(0, 15, 0, 15)
@@ -374,7 +480,7 @@ local function showPlayerDialog()
   layout.addView(lyricsView)
 
   local builder = AlertDialog.Builder(ctx)
-  builder.setTitle("Audio Player Main Controls")
+  builder.setTitle("Media Player Pro Controls")
   builder.setView(scrollView)
   builder.setPositiveButton("Go Back", DialogInterface.OnClickListener{
     onClick = function(d, w)
@@ -407,9 +513,10 @@ local function showPlayerDialog()
           btnPlayPause.setText("Play")
         else
           if currentIndex == -1 and #activeList > 0 then
-            playAudioAtIndex(1)
+            playMediaAtIndex(1)
           else
             mediaPlayer.start()
+            applyPlaybackSpeed()
             isPlaying = true
             btnPlayPause.setText("Pause")
           end
@@ -446,7 +553,7 @@ local function showPlayerDialog()
   btnPrev.setOnClickListener(View.OnClickListener{
     onClick = function(v)
       if currentIndex > 1 then
-        playAudioAtIndex(currentIndex - 1)
+        playMediaAtIndex(currentIndex - 1)
       end
     end
   })
@@ -454,28 +561,23 @@ local function showPlayerDialog()
   btnNext.setOnClickListener(View.OnClickListener{
     onClick = function(v)
       if currentIndex < #activeList then
-        playAudioAtIndex(currentIndex + 1)
+        playMediaAtIndex(currentIndex + 1)
       end
     end
   })
 
   btnSpeed.setOnClickListener(View.OnClickListener{
     onClick = function(v)
-      local speeds = {"0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x"}
-      local speedVals = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}
+      local speeds = {"0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x", "3.0x", "5.0x"}
+      local speedVals = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 5.0}
       local sBuilder = AlertDialog.Builder(ctx)
       sBuilder.setTitle("Playback Speed")
       sBuilder.setItems(speeds, DialogInterface.OnClickListener{
         onClick = function(dialog, which)
-          local rate = speedVals[which + 1]
+          playbackSpeed = speedVals[which + 1]
           btnSpeed.setText("Speed: " .. speeds[which + 1])
-          pcall(function()
-            if Build.VERSION.SDK_INT >= 23 and mediaPlayer then
-              local params = mediaPlayer.getPlaybackParams()
-              params.setSpeed(rate)
-              mediaPlayer.setPlaybackParams(params)
-            end
-          end)
+          prefs.edit().putFloat("playbackSpeed", playbackSpeed).apply()
+          applyPlaybackSpeed()
         end
       })
       showSafeDialog(sBuilder)
@@ -510,12 +612,34 @@ local function showPlayerDialog()
     end
   })
 
-  local isVoiceBoosted = false
-  btnVoiceBoost.setOnClickListener(View.OnClickListener{
+  btnFullscreen.setOnClickListener(View.OnClickListener{
     onClick = function(v)
-      isVoiceBoosted = not isVoiceBoosted
-      btnVoiceBoost.setText(isVoiceBoosted and "Voice Boost: ON" or "Voice Boost: OFF")
-      Toast.makeText(ctx, "Voice Boost " .. (isVoiceBoosted and "Enabled" or "Disabled"), Toast.LENGTH_SHORT).show()
+      if currentIndex ~= -1 and activeList[currentIndex] then
+        local item = activeList[currentIndex]
+        if isVideoFile(item.path) then
+          openDedicatedVideoPlayer(item.path)
+        else
+          Toast.makeText(ctx, "Selected file is an audio track", Toast.LENGTH_SHORT).show()
+        end
+      end
+    end
+  })
+
+  btnAudioCopy.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if currentIndex ~= -1 and activeList[currentIndex] then
+        local item = activeList[currentIndex]
+        showOperationDialog("copy", {{path = item.path, isFolder = false}}, nil, nil)
+      end
+    end
+  })
+
+  btnAudioMove.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if currentIndex ~= -1 and activeList[currentIndex] then
+        local item = activeList[currentIndex]
+        showOperationDialog("move", {{path = item.path, isFolder = false}}, nil, nil)
+      end
     end
   })
 
@@ -558,9 +682,25 @@ local function showPlayerDialog()
       end
     end
   })
+
+  btnFavoriteToggle.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if currentIndex ~= -1 and activeList[currentIndex] then
+        local item = activeList[currentIndex]
+        if favoriteFiles[item.path] then
+          favoriteFiles[item.path] = nil
+          Toast.makeText(ctx, "Removed from Favorites", Toast.LENGTH_SHORT).show()
+        else
+          favoriteFiles[item.path] = true
+          Toast.makeText(ctx, "Added to Favorites", Toast.LENGTH_SHORT).show()
+        end
+        saveHiddenList("favoriteFiles", favoriteFiles)
+      end
+    end
+  })
 end
 
-function playAudioAtIndex(index)
+playMediaAtIndex = function(index)
   if index < 1 or index > #activeList then return end
   currentIndex = index
   local item = activeList[currentIndex]
@@ -571,18 +711,355 @@ function playAudioAtIndex(index)
     mediaPlayer.prepare()
     mediaPlayer.setLooping(singleLoop)
     mediaPlayer.start()
+    applyPlaybackSpeed()
     isPlaying = true
 
-    showPlayerDialog()
-
-    if btnPlayPause then btnPlayPause.setText("Pause") end
-    if trackStatusView then trackStatusView.setText("Playing: " .. item.name) end
-    if seekBar then seekBar.setMax(mediaPlayer.getDuration()) end
-    if timeTotal then timeTotal.setText(formatDuration(mediaPlayer.getDuration())) end
-    if lyricsView then lyricsView.setText("Now Playing: " .. item.name .. "\n(Lyrics / Subtitles ready)") end
+    if isVideoFile(item.path) then
+      openDedicatedVideoPlayer(item.path)
+    else
+      showPlayerDialog()
+      if btnPlayPause then btnPlayPause.setText("Pause") end
+      if trackStatusView then trackStatusView.setText("Playing: " .. item.name) end
+      if seekBar then seekBar.setMax(mediaPlayer.getDuration()) end
+      if timeTotal then timeTotal.setText(formatDuration(mediaPlayer.getDuration())) end
+      if lyricsView then lyricsView.setText("Now Playing: " .. item.name) end
+    end
 
     prefs.edit().putString("lastPlayingPath", item.path).apply()
   end)
+end
+
+openDedicatedVideoPlayer = function(videoPath)
+  local vDialog = Dialog(ctx, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+  local playerRoot = LinearLayout(ctx)
+  playerRoot.setOrientation(LinearLayout.VERTICAL)
+  playerRoot.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT))
+  playerRoot.setBackgroundColor(0xFF000000)
+
+  local headerBar = LinearLayout(ctx)
+  headerBar.setOrientation(LinearLayout.HORIZONTAL)
+  headerBar.setGravity(Gravity.CENTER_VERTICAL)
+  headerBar.setPadding(8, 8, 8, 8)
+  headerBar.setBackgroundColor(0x88000000)
+
+  local vTitle = TextView(ctx)
+  vTitle.setTextColor(0xFFFFFFFF)
+  vTitle.setTextSize(13)
+  vTitle.setGravity(Gravity.CENTER_VERTICAL)
+  vTitle.setPadding(8, 0, 8, 0)
+  vTitle.setLayoutParams(LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0))
+  headerBar.addView(vTitle)
+
+  local lblSpeed = TextView(ctx)
+  lblSpeed.setText("Speed: ")
+  lblSpeed.setTextColor(0xFFFFFFFF)
+  lblSpeed.setTextSize(12)
+  headerBar.addView(lblSpeed)
+
+  local speedCombo = Spinner(ctx)
+  local speedOpts = {"0.5x", "1x", "1.5x", "2x", "3x", "5x", "10x"}
+  local speedVals = {0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0}
+  local speedComboAdapter = ArrayAdapter(ctx, android.R.layout.simple_spinner_item, speedOpts)
+  speedComboAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+  speedCombo.setAdapter(speedComboAdapter)
+
+  local initialComboIdx = 1
+  for idx, spd in ipairs(speedVals) do
+    if math.abs(spd - playbackSpeed) < 0.05 then
+      initialComboIdx = idx - 1
+      break
+    end
+  end
+  speedCombo.setSelection(initialComboIdx)
+  headerBar.addView(speedCombo)
+
+  local btnVideoFav = Button(ctx)
+  btnVideoFav.setText("Fav")
+  btnVideoFav.setTextSize(10)
+  headerBar.addView(btnVideoFav)
+
+  local btnVideoCopy = Button(ctx)
+  btnVideoCopy.setText("Copy")
+  btnVideoCopy.setTextSize(10)
+  headerBar.addView(btnVideoCopy)
+
+  local btnVideoMove = Button(ctx)
+  btnVideoMove.setText("Move")
+  btnVideoMove.setTextSize(10)
+  headerBar.addView(btnVideoMove)
+
+  local btnGoBack = Button(ctx)
+  btnGoBack.setText("Go Back")
+  headerBar.addView(btnGoBack)
+
+  playerRoot.addView(headerBar)
+
+  local videoFrame = FrameLayout(ctx)
+  local frameParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0)
+  videoFrame.setLayoutParams(frameParams)
+
+  local videoView = VideoView(ctx)
+  local vvParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+  vvParams.gravity = Gravity.CENTER
+  videoView.setLayoutParams(vvParams)
+  videoFrame.addView(videoView)
+
+  playerRoot.addView(videoFrame)
+
+  local controlBox = LinearLayout(ctx)
+  controlBox.setOrientation(LinearLayout.VERTICAL)
+  controlBox.setBackgroundColor(0xAA000000)
+  controlBox.setPadding(12, 8, 12, 12)
+
+  local timeRow = LinearLayout(ctx)
+  timeRow.setOrientation(LinearLayout.HORIZONTAL)
+  timeRow.setGravity(Gravity.CENTER_VERTICAL)
+
+  local vTimeCur = TextView(ctx)
+  vTimeCur.setTextColor(0xFFFFFFFF)
+  vTimeCur.setText("00:00")
+  timeRow.addView(vTimeCur)
+
+  local vSeekBar = SeekBar(ctx)
+  vSeekBar.setLayoutParams(LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0))
+  timeRow.addView(vSeekBar)
+
+  local vTimeTot = TextView(ctx)
+  vTimeTot.setTextColor(0xFFFFFFFF)
+  vTimeTot.setText("00:00")
+  timeRow.addView(vTimeTot)
+
+  controlBox.addView(timeRow)
+
+  local actionsRow = LinearLayout(ctx)
+  actionsRow.setOrientation(LinearLayout.HORIZONTAL)
+  actionsRow.setGravity(Gravity.CENTER)
+
+  local function makeActionBtn(text)
+    local b = Button(ctx)
+    b.setText(text)
+    b.setTextSize(10)
+    b.setPadding(4, 4, 4, 4)
+    local p = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+    p.setMargins(2, 0, 2, 0)
+    b.setLayoutParams(p)
+    return b
+  end
+
+  local btnVPrev = makeActionBtn("Previous Video")
+  actionsRow.addView(btnVPrev)
+
+  local btnVRewind = makeActionBtn("Rewind")
+  actionsRow.addView(btnVRewind)
+
+  local btnVPlayPause = makeActionBtn("Pause")
+  actionsRow.addView(btnVPlayPause)
+
+  local btnVFastForward = makeActionBtn("FastForward")
+  actionsRow.addView(btnVFastForward)
+
+  local btnVNext = makeActionBtn("Next Video")
+  actionsRow.addView(btnVNext)
+
+  controlBox.addView(actionsRow)
+  playerRoot.addView(controlBox)
+
+  vDialog.setContentView(playerRoot)
+
+  local videoMediaController = nil
+  local isVideoActive = true
+
+  local function applyVVPlaybackSpeed(speedVal)
+    playbackSpeed = speedVal
+    prefs.edit().putFloat("playbackSpeed", playbackSpeed).apply()
+    if Build.VERSION.SDK_INT >= 23 and videoMediaController then
+      pcall(function()
+        local PlaybackParamsClass = luajava.bindClass("android.media.PlaybackParams")
+        local p = videoMediaController.getPlaybackParams()
+        if not p then p = PlaybackParamsClass() end
+        p.setSpeed(speedVal)
+        videoMediaController.setPlaybackParams(p)
+      end)
+    end
+  end
+
+  local function startVideo(path)
+    if not path or path == "" then return end
+    pcall(function()
+      if mediaPlayer and mediaPlayer.isPlaying() then
+        mediaPlayer.pause()
+        isPlaying = false
+        if btnPlayPause then btnPlayPause.setText("Play") end
+      end
+    end)
+
+    vTitle.setText(File(path).getName())
+    videoView.setVideoPath(path)
+    videoView.requestFocus()
+    videoView.start()
+    btnVPlayPause.setText("Pause")
+    prefs.edit().putString("lastPlayingPath", path).apply()
+  end
+
+  videoView.setOnPreparedListener(MediaPlayer.OnPreparedListener{
+    onPrepared = function(mp)
+      videoMediaController = mp
+      mp.setLooping(singleLoop)
+      vSeekBar.setMax(videoView.getDuration())
+      vTimeTot.setText(formatDuration(videoView.getDuration()))
+      applyVVPlaybackSpeed(playbackSpeed)
+    end
+  })
+
+  videoView.setOnCompletionListener(MediaPlayer.OnCompletionListener{
+    onCompletion = function(mp)
+      if singleLoop then
+        videoView.seekTo(0)
+        videoView.start()
+      elseif currentIndex < #activeList and currentIndex > 0 then
+        currentIndex = currentIndex + 1
+        startVideo(activeList[currentIndex].path)
+      else
+        btnVPlayPause.setText("Play")
+      end
+    end
+  })
+
+  speedCombo.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
+    onItemSelected = function(p, v, pos, id)
+      applyVVPlaybackSpeed(speedVals[pos + 1])
+    end,
+    onNothingSelected = function(p) end
+  })
+
+  btnVideoFav.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if currentIndex ~= -1 and activeList[currentIndex] then
+        local item = activeList[currentIndex]
+        if favoriteFiles[item.path] then
+          favoriteFiles[item.path] = nil
+          Toast.makeText(ctx, "Removed from Favorites", Toast.LENGTH_SHORT).show()
+        else
+          favoriteFiles[item.path] = true
+          Toast.makeText(ctx, "Added to Favorites", Toast.LENGTH_SHORT).show()
+        end
+        saveHiddenList("favoriteFiles", favoriteFiles)
+      end
+    end
+  })
+
+  btnVideoCopy.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if currentIndex ~= -1 and activeList[currentIndex] then
+        local item = activeList[currentIndex]
+        showOperationDialog("copy", {{path = item.path, isFolder = false}}, nil, nil)
+      end
+    end
+  })
+
+  btnVideoMove.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if currentIndex ~= -1 and activeList[currentIndex] then
+        local item = activeList[currentIndex]
+        showOperationDialog("move", {{path = item.path, isFolder = false}}, nil, nil)
+      end
+    end
+  })
+
+  local vHandler = Handler(Looper.getMainLooper())
+  local vRunnable
+  vRunnable = Runnable{
+    run = function()
+      pcall(function()
+        if isVideoActive and videoView and videoView.isPlaying() then
+          local cur = videoView.getCurrentPosition()
+          local dur = videoView.getDuration()
+          vSeekBar.setProgress(cur)
+          vTimeCur.setText(formatDuration(cur))
+          vSeekBar.setMax(dur)
+          vTimeTot.setText(formatDuration(dur))
+        end
+      end)
+      if isVideoActive then
+        vHandler.postDelayed(vRunnable, 1000)
+      end
+    end
+  }
+  vHandler.postDelayed(vRunnable, 1000)
+
+  vSeekBar.setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener{
+    onProgressChanged = function(sb, progress, fromUser)
+      if fromUser and videoView then
+        videoView.seekTo(progress)
+        vTimeCur.setText(formatDuration(progress))
+      end
+    end,
+    onStartTrackingTouch = function(sb) end,
+    onStopTrackingTouch = function(sb) end
+  })
+
+  btnVPlayPause.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if videoView.isPlaying() then
+        videoView.pause()
+        btnVPlayPause.setText("Play")
+      else
+        videoView.start()
+        btnVPlayPause.setText("Pause")
+        applyVVPlaybackSpeed(playbackSpeed)
+      end
+    end
+  })
+
+  btnVRewind.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      local pos = math.max(0, videoView.getCurrentPosition() - skipDuration)
+      videoView.seekTo(pos)
+    end
+  })
+
+  btnVFastForward.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      local pos = math.min(videoView.getDuration(), videoView.getCurrentPosition() + skipDuration)
+      videoView.seekTo(pos)
+    end
+  })
+
+  btnVPrev.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if currentIndex > 1 then
+        currentIndex = currentIndex - 1
+        startVideo(activeList[currentIndex].path)
+      end
+    end
+  })
+
+  btnVNext.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      if currentIndex < #activeList then
+        currentIndex = currentIndex + 1
+        startVideo(activeList[currentIndex].path)
+      end
+    end
+  })
+
+  btnGoBack.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      isVideoActive = false
+      videoView.stopPlayback()
+      vDialog.dismiss()
+    end
+  })
+
+  vDialog.setOnDismissListener(DialogInterface.OnDismissListener{
+    onDismiss = function(d)
+      isVideoActive = false
+      videoView.stopPlayback()
+    end
+  })
+
+  startVideo(videoPath)
+  showSafeDialog(vDialog)
 end
 
 local updateHandler = Handler(Looper.getMainLooper())
@@ -618,9 +1095,9 @@ updateHandler.postDelayed(updateRunnable, 1000)
 mediaPlayer.setOnCompletionListener(MediaPlayer.OnCompletionListener{
   onCompletion = function(mp)
     if singleLoop then
-      playAudioAtIndex(currentIndex)
+      playMediaAtIndex(currentIndex)
     elseif currentIndex < #activeList and currentIndex > 0 then
-      playAudioAtIndex(currentIndex + 1)
+      playMediaAtIndex(currentIndex + 1)
     else
       isPlaying = false
       if btnPlayPause then btnPlayPause.setText("Play") end
@@ -629,7 +1106,71 @@ mediaPlayer.setOnCompletionListener(MediaPlayer.OnCompletionListener{
   end
 })
 
-local scanAudioFilesAsync
+local function scanMediaFiles()
+  mediaList = {}
+  folderList = {}
+  local folderMap = {}
+
+  local resolver = ctx.getContentResolver()
+  if not resolver then return end
+
+  local scanUri = function(uri)
+    local projection = {
+      MediaStore.MediaColumns._ID,
+      MediaStore.MediaColumns.DISPLAY_NAME,
+      MediaStore.MediaColumns.DATA,
+      MediaStore.MediaColumns.SIZE,
+      MediaStore.MediaColumns.DATE_MODIFIED,
+      MediaStore.MediaColumns.DURATION
+    }
+    local cursor = resolver.query(uri, projection, nil, nil, nil)
+    if cursor ~= nil then
+      while cursor.moveToNext() do
+        local id = cursor.getLong(cursor.getColumnIndex(MediaStore.MediaColumns._ID))
+        local name = cursor.getString(cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME))
+        local path = cursor.getString(cursor.getColumnIndex(MediaStore.MediaColumns.DATA))
+        local size = cursor.getLong(cursor.getColumnIndex(MediaStore.MediaColumns.SIZE))
+        local date = cursor.getLong(cursor.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED))
+        local duration = cursor.getLong(cursor.getColumnIndex(MediaStore.MediaColumns.DURATION))
+
+        if path and File(path).exists() and isMediaFile(name or path) then
+          local parentFile = File(path).getParentFile()
+          local folderPath = parentFile and parentFile.getAbsolutePath() or ""
+          local item = {
+            id = id,
+            name = name or "Unknown",
+            path = path,
+            size = size or 0,
+            date = date or 0,
+            duration = duration or 0,
+            folderPath = folderPath
+          }
+          table.insert(mediaList, item)
+
+          if folderPath ~= "" then
+            if not folderMap[folderPath] then
+              folderMap[folderPath] = {
+                name = parentFile.getName(),
+                path = folderPath,
+                count = 0
+              }
+              table.insert(folderList, folderMap[folderPath])
+            end
+            folderMap[folderPath].count = folderMap[folderPath].count + 1
+          end
+        end
+      end
+      cursor.close()
+    end
+  end
+
+  pcall(function() scanUri(MediaStore.Video.Media.EXTERNAL_CONTENT_URI) end)
+  pcall(function() scanUri(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) end)
+
+  table.sort(folderList, function(a, b) return a.name:lower() < b.name:lower() end)
+end
+
+scanMediaFiles()
 
 local function shareItem(item, isFolderMode)
   if isFolderMode then
@@ -638,12 +1179,12 @@ local function shareItem(item, isFolderMode)
   end
   pcall(function()
     local intent = Intent(Intent.ACTION_SEND)
-    intent.setType("audio/*")
+    intent.setType(isVideoFile(item.path) and "video/*" or "audio/*")
     local file = File(item.path)
     local uri = Uri.fromFile(file)
     intent.putExtra(Intent.EXTRA_STREAM, uri)
     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    ctx.startActivity(Intent.createChooser(intent, "Share Audio File"))
+    ctx.startActivity(Intent.createChooser(intent, "Share Media File"))
   end)
 end
 
@@ -661,7 +1202,7 @@ local function deleteItem(item, isFolderMode, onComplete)
           file.delete()
         end
         Toast.makeText(ctx, "Deleted successfully", Toast.LENGTH_SHORT).show()
-        if scanAudioFilesAsync then scanAudioFilesAsync() end
+        scanMediaFiles()
         if onComplete then onComplete() end
       end)
     end
@@ -686,7 +1227,7 @@ local function renameItem(item, isFolderMode, onComplete)
           local newFile = File(parent, newName)
           if oldFile.renameTo(newFile) then
             Toast.makeText(ctx, "Renamed successfully", Toast.LENGTH_SHORT).show()
-            if scanAudioFilesAsync then scanAudioFilesAsync() end
+            scanMediaFiles()
             if onComplete then onComplete() end
           else
             Toast.makeText(ctx, "Rename failed", Toast.LENGTH_SHORT).show()
@@ -699,9 +1240,7 @@ local function renameItem(item, isFolderMode, onComplete)
   showSafeDialog(builder)
 end
 
-local openExplorerDialog
-
-local function showOperationDialog(mode, selectedItems, currentExplorerDialog)
+showOperationDialog = function(mode, selectedItems, currentExplorerDialog, mediaFilterType)
   local dialogLayout = LinearLayout(ctx)
   dialogLayout.setOrientation(LinearLayout.VERTICAL)
   dialogLayout.setPadding(16, 16, 16, 16)
@@ -804,8 +1343,10 @@ local function showOperationDialog(mode, selectedItems, currentExplorerDialog)
                 if currentExplorerDialog then
                   currentExplorerDialog.dismiss()
                 end
-                if scanAudioFilesAsync then scanAudioFilesAsync() end
-                openExplorerDialog(false, selectedFolder.path, false, false)
+                scanMediaFiles()
+                if mediaFilterType then
+                  openExplorerDialog(false, selectedFolder.path, false, false, mediaFilterType)
+                end
               end
             })
           end)
@@ -815,7 +1356,7 @@ local function showOperationDialog(mode, selectedItems, currentExplorerDialog)
   })
 end
 
-local function showActionDialog(item, isFolderMode, isHiddenMode, onComplete, currentExplorerDialog, isGlobalFilesView)
+local function showActionDialog(item, isFolderMode, isHiddenMode, onComplete, currentExplorerDialog, isGlobalFilesView, mediaFilterType)
   local options = {}
   if isHiddenMode then
     if isGlobalFilesView then
@@ -867,14 +1408,14 @@ local function showActionDialog(item, isFolderMode, isHiddenMode, onComplete, cu
           end
           Toast.makeText(ctx, "Hidden successfully", Toast.LENGTH_SHORT).show()
         end
-        if scanAudioFilesAsync then scanAudioFilesAsync() end
+        scanMediaFiles()
         if onComplete then onComplete() end
       elseif selectedOption == "Copy" then
-        showOperationDialog("copy", {{path = item.path, isFolder = isFolderMode}}, currentExplorerDialog)
+        showOperationDialog("copy", {{path = item.path, isFolder = isFolderMode}}, currentExplorerDialog, mediaFilterType)
       elseif selectedOption == "Move" then
-        showOperationDialog("move", {{path = item.path, isFolder = isFolderMode}}, currentExplorerDialog)
+        showOperationDialog("move", {{path = item.path, isFolder = isFolderMode}}, currentExplorerDialog, mediaFilterType)
       elseif selectedOption == "Set as Ringtone / Trim" then
-        Toast.makeText(ctx, "Audio Trimmer & Ringtone Set Executed", Toast.LENGTH_SHORT).show()
+        Toast.makeText(ctx, "Trimmer & Ringtone Set Executed", Toast.LENGTH_SHORT).show()
       elseif selectedOption == "Add to Favorites" then
         favoriteFiles[item.path] = true
         saveHiddenList("favoriteFiles", favoriteFiles)
@@ -892,7 +1433,7 @@ local function showActionDialog(item, isFolderMode, isHiddenMode, onComplete, cu
   showSafeDialog(builder)
 end
 
-openExplorerDialog = function(isFolderMode, folderPath, isHiddenMode, isFavMode)
+openExplorerDialog = function(isFolderMode, folderPath, isHiddenMode, isFavMode, mediaFilterType)
   local isGlobalFilesView = (not isFolderMode and folderPath == nil)
 
   local dialogLayout = LinearLayout(ctx)
@@ -903,7 +1444,7 @@ openExplorerDialog = function(isFolderMode, folderPath, isHiddenMode, isFavMode)
   searchRowLayout.setOrientation(LinearLayout.HORIZONTAL)
 
   local searchInput = EditText(ctx)
-  searchInput.setHint(isFolderMode and "Search folders..." or "Search files...")
+  searchInput.setHint(isFolderMode and "Search folders..." or "Search media files...")
   searchInput.setLayoutParams(LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1))
   searchRowLayout.addView(searchInput)
 
@@ -939,39 +1480,58 @@ openExplorerDialog = function(isFolderMode, folderPath, isHiddenMode, isFavMode)
   local function loadData()
     currentItems = {}
     if isFavMode then
-      for _, a in ipairs(audioList) do
+      for _, a in ipairs(mediaList) do
         if favoriteFiles[a.path] then
-          table.insert(currentItems, a)
+          if not mediaFilterType or (mediaFilterType == "audio" and isAudioFile(a.path)) or (mediaFilterType == "video" and isVideoFile(a.path)) then
+            table.insert(currentItems, a)
+          end
         end
       end
     elseif isFolderMode then
       for _, f in ipairs(folderList) do
         local isHidden = hiddenFolders[f.path] or false
-        if isHiddenMode then
-          if isHidden then table.insert(currentItems, f) end
-        else
-          if not isHidden then table.insert(currentItems, f) end
+        local matchesFilter = true
+        if mediaFilterType then
+          matchesFilter = false
+          for _, a in ipairs(mediaList) do
+            if a.folderPath == f.path then
+              if mediaFilterType == "audio" and isAudioFile(a.path) then matchesFilter = true; break; end
+              if mediaFilterType == "video" and isVideoFile(a.path) then matchesFilter = true; break; end
+            end
+          end
+        end
+
+        if matchesFilter then
+          if isHiddenMode then
+            if isHidden then table.insert(currentItems, f) end
+          else
+            if not isHidden then table.insert(currentItems, f) end
+          end
         end
       end
     else
       if folderPath then
-        for _, a in ipairs(audioList) do
+        for _, a in ipairs(mediaList) do
           if a.folderPath == folderPath then
-            if isHiddenMode then
-              table.insert(currentItems, a)
-            else
-              local isHidden = hiddenFiles[a.path] or false
-              if not isHidden then table.insert(currentItems, a) end
+            if not mediaFilterType or (mediaFilterType == "audio" and isAudioFile(a.path)) or (mediaFilterType == "video" and isVideoFile(a.path)) then
+              if isHiddenMode then
+                table.insert(currentItems, a)
+              else
+                local isHidden = hiddenFiles[a.path] or false
+                if not isHidden then table.insert(currentItems, a) end
+              end
             end
           end
         end
       else
-        for _, a in ipairs(audioList) do
-          local isHidden = hiddenFiles[a.path] or false
-          if isHiddenMode then
-            if isHidden then table.insert(currentItems, a) end
-          else
-            if not isHidden then table.insert(currentItems, a) end
+        for _, a in ipairs(mediaList) do
+          if not mediaFilterType or (mediaFilterType == "audio" and isAudioFile(a.path)) or (mediaFilterType == "video" and isVideoFile(a.path)) then
+            local isHidden = hiddenFiles[a.path] or false
+            if isHiddenMode then
+              if isHidden then table.insert(currentItems, a) end
+            else
+              if not isHidden then table.insert(currentItems, a) end
+            end
           end
         end
       end
@@ -991,9 +1551,10 @@ openExplorerDialog = function(isFolderMode, folderPath, isHiddenMode, isFavMode)
     local itemStrings = {}
     for i, item in ipairs(displayItems) do
       if isFolderMode then
-        table.insert(itemStrings, string.format("[%d] %s (%d Files)", i, item.name, item.count))
+        table.insert(itemStrings, string.format("[%d] 📁 %s (%d Files)", i, item.name, item.count))
       else
-        table.insert(itemStrings, string.format("[%d] %s (%s | %s)", i, item.name, formatSize(item.size), formatDuration(item.duration)))
+        local icon = isVideoFile(item.path) and "🎬 " or "🎵 "
+        table.insert(itemStrings, string.format("[%d] %s%s (%s | %s)", i, icon, item.name, formatSize(item.size), formatDuration(item.duration)))
       end
     end
 
@@ -1047,11 +1608,12 @@ openExplorerDialog = function(isFolderMode, folderPath, isHiddenMode, isFavMode)
 
   local titleText = ""
   if isFavMode then
-    titleText = "Favorites Audio Files"
+    titleText = "Favorites Media Files"
   elseif isHiddenMode then
-    titleText = isFolderMode and "Hidden Folders List" or "Hidden Audio Files List"
+    titleText = isFolderMode and "Hidden Folders List" or "Hidden Media Files List"
   else
-    titleText = isFolderMode and "Folders List" or "Audio Files List"
+    local prefix = mediaFilterType == "audio" and "Audio " or (mediaFilterType == "video" and "Video " or "")
+    titleText = isFolderMode and (prefix .. "Folders List") or (prefix .. "Media Files List")
   end
 
   local builder = AlertDialog.Builder(ctx)
@@ -1066,13 +1628,13 @@ openExplorerDialog = function(isFolderMode, folderPath, isHiddenMode, isFavMode)
       local selectedItem = displayItems[position + 1]
       if isFolderMode then
         explorerDialog.dismiss()
-        openExplorerDialog(false, selectedItem.path, isHiddenMode, false)
+        openExplorerDialog(false, selectedItem.path, isHiddenMode, false, mediaFilterType)
       else
         activeList = {}
         for _, item in ipairs(displayItems) do
           table.insert(activeList, item)
         end
-        playAudioAtIndex(position + 1)
+        playMediaAtIndex(position + 1)
       end
     end
   })
@@ -1082,23 +1644,11 @@ openExplorerDialog = function(isFolderMode, folderPath, isHiddenMode, isFavMode)
       local selectedItem = displayItems[position + 1]
       showActionDialog(selectedItem, isFolderMode, isHiddenMode, function()
         filterAndRefresh()
-      end, explorerDialog, isGlobalFilesView)
+      end, explorerDialog, isGlobalFilesView, mediaFilterType)
       return true
     end
   })
 end
-
-btnShowFiles.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    openExplorerDialog(false, nil, false, false)
-  end
-})
-
-btnShowFolders.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    openExplorerDialog(true, nil, false, false)
-  end
-})
 
 local function showAboutSupportDialog()
   local builder = AlertDialog.Builder(ctx)
@@ -1113,21 +1663,18 @@ local function showAboutSupportDialog()
   infoText.setTextSize(14)
   infoText.setLineSpacing(4, 1.1)
 
-  local textContent = "Audio Player Pro Advanced Guide\n\n"
-  .. "1. Files & Folders View:\n"
-  .. "- Browse all audio files or folders.\n\n"
-  .. "2. Audio Controls & Main Dialog:\n"
-  .. "- Interactive Visualizer & Waveform Bar.\n"
-  .. "- Playback Speed (0.5x - 2.0x).\n"
+  local textContent = "Media Player Pro Advanced Guide\n\n"
+  .. "1. Merged Video & Audio Capabilities:\n"
+  .. "- Fully handles both Video and Audio playback seamlessly.\n"
+  .. "- Fullscreen dedicated video screen with identical playback controls.\n\n"
+  .. "2. Playback Features & Speed Controls:\n"
+  .. "- Variable speed control (0.5x up to 10.0x).\n"
   .. "- A-B Loop functionality for repeating segments.\n"
-  .. "- Voice Booster & Bookmarks with timestamp notes.\n"
-  .. "- Subtitles & Lyrics display support.\n\n"
-  .. "3. Settings & Smart Features:\n"
-  .. "- Advanced Equalizer & Sound Presets.\n"
-  .. "- Smart Sleep Timer & Gapless Playback.\n"
-  .. "- Skip Silence & AI Noise Reduction.\n"
-  .. "- Crossfade Fade In / Fade Out.\n"
-  .. "- Audio Trimmer & ID3 Tag Editor.\n\n"
+  .. "- Bookmark position markers with interactive notes.\n"
+  .. "- Favorite button available in both audio controls and video player.\n\n"
+  .. "3. File Operations:\n"
+  .. "- Copy, Move, Hide/Show, Delete, and Rename files or folders.\n"
+  .. "- Favorites, Hidden Files, and Hidden Folders are located in Settings.\n\n"
   .. "Developer: Jahanzaib"
 
   infoText.setText(textContent)
@@ -1148,7 +1695,7 @@ btnAboutSupportMain.setOnClickListener(View.OnClickListener{
 
 local function openSettings()
   local settingsDialog = AlertDialog.Builder(ctx)
-  settingsDialog.setTitle("Advanced Audio Settings")
+  settingsDialog.setTitle("Advanced Media Settings")
 
   local scrollView = ScrollView(ctx)
   local layout = LinearLayout(ctx)
@@ -1173,91 +1720,57 @@ local function openSettings()
 
   layout.addView(timeSpinner)
 
-  local eqLabel = TextView(ctx)
-  eqLabel.setText("\nEqualizer Presets:")
-  layout.addView(eqLabel)
+  local speedLabel = TextView(ctx)
+  speedLabel.setText("\nDefault Playback Speed:")
+  layout.addView(speedLabel)
 
-  local eqSpinner = Spinner(ctx)
-  local presets = {"Normal", "Bass Boost", "Treble Boost", "Vocal Boost"}
-  local eqAdapter = ArrayAdapter(ctx, android.R.layout.simple_spinner_item, presets)
-  eqAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-  eqSpinner.setAdapter(eqAdapter)
-  layout.addView(eqSpinner)
+  local speedSpinner = Spinner(ctx)
+  local speedLabels = {"0.5x", "1.0x", "1.5x", "2.0x", "3.0x", "5.0x"}
+  local speedValues = {0.5, 1.0, 1.5, 2.0, 3.0, 5.0}
+  local speedAdapter = ArrayAdapter(ctx, android.R.layout.simple_spinner_item, speedLabels)
+  speedAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+  speedSpinner.setAdapter(speedAdapter)
 
-  local timerLabel = TextView(ctx)
-  timerLabel.setText("\nSmart Sleep Timer:")
-  layout.addView(timerLabel)
-
-  local timerSpinner = Spinner(ctx)
-  local timerOpts = {"Disabled", "15 Minutes", "30 Minutes", "60 Minutes", "End of Track"}
-  local timerAdapter = ArrayAdapter(ctx, android.R.layout.simple_spinner_item, timerOpts)
-  timerAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-  timerSpinner.setAdapter(timerAdapter)
-  layout.addView(timerSpinner)
+  local selectedSpeedIndex = 1
+  for idx, spd in ipairs(speedValues) do
+    if math.abs(spd - playbackSpeed) < 0.05 then
+      selectedSpeedIndex = idx - 1
+      break
+    end
+  end
+  speedSpinner.setSelection(selectedSpeedIndex)
+  layout.addView(speedSpinner)
 
   local chkBgPlay = CheckBox(ctx)
   chkBgPlay.setText("Background Play")
   chkBgPlay.setChecked(backgroundPlay)
+  chkBgPlay.setPadding(0, 15, 0, 10)
   layout.addView(chkBgPlay)
 
   local chkSingleLoop = CheckBox(ctx)
-  chkSingleLoop.setText("Loop Current Audio (Repeat Track)")
+  chkSingleLoop.setText("Loop Current Item")
   chkSingleLoop.setChecked(singleLoop)
+  chkSingleLoop.setPadding(0, 10, 0, 15)
   layout.addView(chkSingleLoop)
 
-  local chkGapless = CheckBox(ctx)
-  chkGapless.setText("Gapless Playback")
-  chkGapless.setChecked(gaplessPlay)
-  layout.addView(chkGapless)
+  local btnFavSettings = Button(ctx)
+  btnFavSettings.setText("Favorites Files")
+  btnFavSettings.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+  layout.addView(btnFavSettings)
 
-  local chkSkipSilence = CheckBox(ctx)
-  chkSkipSilence.setText("Skip Silence (Auto Cut Silence)")
-  chkSkipSilence.setChecked(skipSilence)
-  layout.addView(chkSkipSilence)
+  local btnHiddenFilesSettings = Button(ctx)
+  btnHiddenFilesSettings.setText("Show Hidden Files")
+  btnHiddenFilesSettings.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+  layout.addView(btnHiddenFilesSettings)
 
-  local chkNoiseRed = CheckBox(ctx)
-  chkNoiseRed.setText("AI Noise Reduction")
-  chkNoiseRed.setChecked(noiseReduction)
-  layout.addView(chkNoiseRed)
-
-  local chkFade = CheckBox(ctx)
-  chkFade.setText("Auto Crossfade (Fade In/Out)")
-  chkFade.setChecked(fadeEffect)
-  layout.addView(chkFade)
-
-  local btnShowFavorites = Button(ctx)
-  btnShowFavorites.setText("Show Favorites")
-  btnShowFavorites.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-  btnShowFavorites.setOnClickListener(View.OnClickListener{
-    onClick = function(v)
-      openExplorerDialog(false, nil, false, true)
-    end
-  })
-  layout.addView(btnShowFavorites)
-
-  local btnHiddenFiles = Button(ctx)
-  btnHiddenFiles.setText("Show Hidden Files")
-  btnHiddenFiles.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-  btnHiddenFiles.setOnClickListener(View.OnClickListener{
-    onClick = function(v)
-      openExplorerDialog(false, nil, true, false)
-    end
-  })
-  layout.addView(btnHiddenFiles)
-
-  local btnHiddenFolders = Button(ctx)
-  btnHiddenFolders.setText("Show Hidden Folders")
-  btnHiddenFolders.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-  btnHiddenFolders.setOnClickListener(View.OnClickListener{
-    onClick = function(v)
-      openExplorerDialog(true, nil, true, false)
-    end
-  })
-  layout.addView(btnHiddenFolders)
+  local btnHiddenFoldersSettings = Button(ctx)
+  btnHiddenFoldersSettings.setText("Show Hidden Folders")
+  btnHiddenFoldersSettings.setLayoutParams(LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+  layout.addView(btnHiddenFoldersSettings)
 
   settingsDialog.setView(scrollView)
 
-  settingsDialog.setPositiveButton("Save Settings", DialogInterface.OnClickListener{
+  settingsDialog.setPositiveButton("Save", DialogInterface.OnClickListener{
     onClick = function(d, w)
       local selectedPos = timeSpinner.getSelectedItemPosition()
       if selectedPos == 0 then skipDuration = 10000
@@ -1265,59 +1778,55 @@ local function openSettings()
       elseif selectedPos == 2 then skipDuration = 30000
       elseif selectedPos == 3 then skipDuration = 60000 end
 
+      local speedPos = speedSpinner.getSelectedItemPosition()
+      playbackSpeed = speedValues[speedPos + 1] or 1.0
+
       backgroundPlay = chkBgPlay.isChecked()
       singleLoop = chkSingleLoop.isChecked()
-      gaplessPlay = chkGapless.isChecked()
-      skipSilence = chkSkipSilence.isChecked()
-      noiseReduction = chkNoiseRed.isChecked()
-      fadeEffect = chkFade.isChecked()
 
-      eqPreset = presets[eqSpinner.getSelectedItemPosition() + 1]
-
-      local timerSel = timerSpinner.getSelectedItemPosition()
-      if sleepTimerRunnable then
-        sleepTimerHandler.removeCallbacks(sleepTimerRunnable)
-      end
-      if timerSel > 0 and timerSel < 4 then
-        local mins = timerSel == 1 and 15 or (timerSel == 2 and 30 or 60)
-        sleepTimerRunnable = Runnable{
-          run = function()
-            pcall(function()
-              if mediaPlayer then mediaPlayer.pause() end
-              Toast.makeText(ctx, "Sleep Timer: Audio Paused", Toast.LENGTH_SHORT).show()
-            end)
-          end
-        }
-        sleepTimerHandler.postDelayed(sleepTimerRunnable, mins * 60 * 1000)
-      end
-
-      if mediaPlayer then
-        pcall(function() mediaPlayer.setLooping(singleLoop) end)
+      if mediaPlayer then 
+        pcall(function() mediaPlayer.setLooping(singleLoop) end) 
+        applyPlaybackSpeed()
       end
 
       local editor = prefs.edit()
       editor.putInt("skipDuration", skipDuration)
+      editor.putFloat("playbackSpeed", playbackSpeed)
       editor.putBoolean("backgroundPlay", backgroundPlay)
       editor.putBoolean("singleLoop", singleLoop)
-      editor.putBoolean("gaplessPlay", gaplessPlay)
-      editor.putBoolean("skipSilence", skipSilence)
-      editor.putBoolean("noiseReduction", noiseReduction)
-      editor.putBoolean("fadeEffect", fadeEffect)
-      editor.putString("eqPreset", eqPreset)
       editor.apply()
 
-      Toast.makeText(ctx, "All settings saved successfully!", Toast.LENGTH_SHORT).show()
+      Toast.makeText(ctx, "Settings saved", Toast.LENGTH_SHORT).show()
     end
   })
 
   settingsDialog.setNegativeButton("Go Back", nil)
-  showSafeDialog(settingsDialog)
+  local setDlg = showSafeDialog(settingsDialog)
+
+  btnFavSettings.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      setDlg.dismiss()
+      openExplorerDialog(false, nil, false, true, nil)
+    end
+  })
+
+  btnHiddenFilesSettings.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      setDlg.dismiss()
+      openExplorerDialog(false, nil, true, false, nil)
+    end
+  })
+
+  btnHiddenFoldersSettings.setOnClickListener(View.OnClickListener{
+    onClick = function(v)
+      setDlg.dismiss()
+      openExplorerDialog(true, nil, true, false, nil)
+    end
+  })
 end
 
 btnSettings.setOnClickListener(View.OnClickListener{
-  onClick = function(v)
-    openSettings()
-  end
+  onClick = function(v) openSettings() end
 })
 
 btnExit.setOnClickListener(View.OnClickListener{
@@ -1340,364 +1849,4 @@ btnExit.setOnClickListener(View.OnClickListener{
   end
 })
 
-scanAudioFilesAsync = function()
-  Thread(Runnable{
-    run = function()
-      local tempAudioList = {}
-      local folderMap = {}
-      local tempFolderList = {}
-
-      local resolver = ctx.getContentResolver()
-      if resolver then
-        local uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-        local projection = {
-          MediaStore.Audio.Media._ID,
-          MediaStore.Audio.Media.DISPLAY_NAME,
-          MediaStore.Audio.Media.DATA,
-          MediaStore.Audio.Media.SIZE,
-          MediaStore.Audio.Media.DATE_MODIFIED,
-          MediaStore.Audio.Media.DURATION
-        }
-        local selection = MediaStore.Audio.Media.IS_MUSIC .. " != 0"
-        local cursor = resolver.query(uri, projection, selection, nil, nil)
-
-        if cursor ~= nil then
-          local idCol = cursor.getColumnIndex(MediaStore.Audio.Media._ID)
-          local nameCol = cursor.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME)
-          local dataCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
-          local sizeCol = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
-          local dateCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATE_MODIFIED)
-          local durCol = cursor.getColumnIndex(MediaStore.Audio.Media.DURATION)
-
-          while cursor.moveToNext() do
-            local path = cursor.getString(dataCol)
-            if path and File(path).exists() then
-              local audioFile = File(path)
-              local parentFile = audioFile.getParentFile()
-              local folderPath = parentFile and parentFile.getAbsolutePath() or "Unknown"
-              local folderName = parentFile and parentFile.getName() or "Unknown"
-
-              table.insert(tempAudioList, {
-                id = cursor.getLong(idCol),
-                name = cursor.getString(nameCol) or "Unknown",
-                path = path,
-                size = cursor.getLong(sizeCol) or 0,
-                date = cursor.getLong(dateCol) or 0,
-                duration = cursor.getLong(durCol) or 0,
-                folderPath = folderPath,
-                folderName = folderName
-              })
-
-              if not folderMap[folderPath] then
-                folderMap[folderPath] = {
-                  name = folderName,
-                  path = folderPath,
-                  count = 1
-                }
-              else
-                folderMap[folderPath].count = folderMap[folderPath].count + 1
-              end
-            end
-          end
-          cursor.close()
-        end
-      end
-
-      for _, f in pairs(folderMap) do
-        table.insert(tempFolderList, f)
-      end
-
-      mainHandler.post(Runnable{
-        run = function()
-          audioList = tempAudioList
-          folderList = tempFolderList
-
-          local visibleFilesCount = 0
-          for _, a in ipairs(audioList) do
-            if not hiddenFiles[a.path] then
-              visibleFilesCount = visibleFilesCount + 1
-            end
-          end
-
-          local visibleFoldersCount = 0
-          for _, f in ipairs(folderList) do
-            if not hiddenFolders[f.path] then
-              visibleFoldersCount = visibleFoldersCount + 1
-            end
-          end
-
-          btnShowFiles.setText(string.format("Files (%d files)", visibleFilesCount))
-          btnShowFiles.setContentDescription(string.format("Files, total %d files", visibleFilesCount))
-
-          btnShowFolders.setText(string.format("Folders (%d folders)", visibleFoldersCount))
-          btnShowFolders.setContentDescription(string.format("Folders, total %d folders", visibleFoldersCount))
-        end
-      })
-    end
-  }).start()
-end
-
-scanAudioFilesAsync()
-
-require "import"
-import "com.androlua.Http"
-import "com.androlua.LuaDialog"
-import "android.widget.Toast"
-import "android.os.Handler"
-import "android.os.Looper"
-import "java.lang.Thread"
-import "java.lang.Runnable"
-import "java.lang.System"
-import "java.io.File"
-import "android.content.Context"
-import "android.media.ToneGenerator"
-import "android.media.AudioManager"
-import "android.os.Vibrator"
-import "android.os.Build"
-import "android.os.VibrationEffect"
-
-local CURRENT_VERSION = "1.1"
-local VERSION_URL = "https://raw.githubusercontent.com/hafizshanmemon116-cmyk/Audio-Player-Pro/main/version.txt"
-local UPDATE_CODE_URL = "https://raw.githubusercontent.com/hafizshanmemon116-cmyk/Audio-Player-Pro/main/main.lua"
-local PLUGIN_PATH = (function()
-    local src = debug.getinfo(1, "S").source
-    return src and src:match("^@?(.*)$") or ""
-end)()
-local updateInProgress = false
-
-local prefs = (service or activity).getSharedPreferences("AutoUpdatePrefs", Context.MODE_PRIVATE)
-
-local function playNotification()
-    pcall(function()
-        local tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
-        tone.startTone(ToneGenerator.TONE_PROP_ACK, 100)
-        local vibrator = (service or activity).getSystemService(Context.VIBRATOR_SERVICE)
-        if vibrator then
-            if Build.VERSION.SDK_INT >= 26 then
-                vibrator.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
-            else
-                vibrator.vibrate(200)
-            end
-        end
-    end)
-end
-
-local function trim(s)
-    if s == nil then return "" end
-    return tostring(s):gsub("^%s*(.-)%s*$", "%1")
-end
-
-local function showUpdateErrorDialog(title, message)
-    Handler(Looper.getMainLooper()).post(Runnable({
-        run = function()
-            local errorDialog = LuaDialog(service or activity)
-            errorDialog.setTitle(title)
-            errorDialog.setMessage(message)
-            errorDialog.setButton("OK", function()
-                errorDialog.dismiss()
-            end)
-            errorDialog.show()
-        end
-    }))
-end
-
-local function checkAndShowNewFeatures()
-    local lastShown = prefs.getString("lastShownVersion", "")
-    if lastShown ~= CURRENT_VERSION then
-        Handler(Looper.getMainLooper()).post(Runnable{
-            run=function()
-                playNotification()
-                local featuresDialog = LuaDialog(service or activity)
-                featuresDialog.setTitle("New Update Details")
-                featuresDialog.setMessage("Audio Player Pro Advanced Guide\
-\
-1. Files & Folders View:\
-- Browse all audio files or folders.\
-\
-2. Audio Controls & Main Dialog:\
-- Interactive Visualizer & Waveform Bar.\
-- Playback Speed (0.5x - 2.0x).\
-- A-B Loop functionality for repeating segments.\
-- Voice Booster & Bookmarks with timestamp notes.\
-- Subtitles & Lyrics display support.\
-\
-3. Settings & Smart Features:\
-- Advanced Equalizer & Sound Presets.\
-- Smart Sleep Timer & Gapless Playback.\
-- Skip Silence & AI Noise Reduction.\
-- Crossfade Fade In / Fade Out.\
-- Audio Trimmer & ID3 Tag Editor.\
-\
-Developer: Jahanzaib")
-                featuresDialog.setButton("OK", function() 
-                    featuresDialog.dismiss() 
-                end)
-                featuresDialog.show()
-                prefs.edit().putString("lastShownVersion", CURRENT_VERSION).apply()
-            end
-        })
-    end
-end
-
-local function performUpdate(mainCode, onlineVersion)
-    if not mainCode or trim(mainCode) == "" then
-        showUpdateErrorDialog("Update Failed", "Main plugin code is empty.")
-        return
-    end
-    
-    updateInProgress = true
-    
-    local function updateProcess()
-        local currentFileSrc = debug.getinfo(1, "S").source
-        local currentFilePath = currentFileSrc and currentFileSrc:match("^@?(.*)$") or ""
-        
-        if currentFilePath ~= "" and currentFilePath ~= PLUGIN_PATH then
-            pcall(function()
-                os.rename(currentFilePath, PLUGIN_PATH)
-            end)
-        end
-        
-        local success = false
-        local tempPath = PLUGIN_PATH .. ".temp_update"
-        local f = io.open(tempPath, "w")
-        if f then
-            f:write(mainCode)
-            f:close()
-            
-            local fileExists = io.open(PLUGIN_PATH, "r")
-            if fileExists then
-                fileExists:close()
-                local delSuccess = pcall(function()
-                    os.remove(PLUGIN_PATH)
-                end)
-                if delSuccess then
-                    local renameSuccess = pcall(function()
-                        os.rename(tempPath, PLUGIN_PATH)
-                    end)
-                    if renameSuccess then
-                        success = true
-                    end
-                end
-            else
-                local renameSuccess = pcall(function()
-                    os.rename(tempPath, PLUGIN_PATH)
-                end)
-                if renameSuccess then
-                    success = true
-                end
-            end
-            
-            if not success then
-                pcall(function() os.remove(tempPath) end)
-            end
-        end
-        
-        if success then
-            updateInProgress = false
-            Handler(Looper.getMainLooper()).post(Runnable({
-                run = function()
-                    playNotification()
-                    local successDialog = LuaDialog(service or activity)
-                    successDialog.setTitle("Update Successful")
-                    successDialog.setMessage("Successfully updated to the latest version.\n\nClick OK to restart and apply the update.")
-                    successDialog.setButton("OK", function()
-                        successDialog.dismiss()
-                        
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function()
-                                pcall(function() if _G.mainDialog then _G.mainDialog.dismiss() _G.mainDialog = nil end end)
-                                pcall(function() if _G.mainDlg then _G.mainDlg.dismiss() _G.mainDlg = nil end end)
-                                pcall(function() if _G.allDialogBox then _G.allDialogBox.dismiss() _G.allDialogBox = nil end end)
-                                pcall(function() if _G.alertDialogBox then _G.alertDialogBox.dismiss() _G.alertDialogBox = nil end end)
-                                
-                                pcall(function() if _G.dismissAllDialogs then _G.dismissAllDialogs() end end)
-                                pcall(function() if _G.dismissAll then _G.dismissAll() end end)
-                                pcall(function() if _G.dismiss then _G.dismiss() end end)
-                                pcall(function() if dismissAllDialogs then dismissAllDialogs() end end)
-                                pcall(function() if dismissAll then dismissAll() end end)
-
-                                pcall(function()
-                                    if activity then
-                                        activity.finish()
-                                    end
-                                end)
-                            end
-                        }))
-                        
-                        Handler(Looper.getMainLooper()).postDelayed(Runnable({
-                            run = function()
-                                prefs.edit().putString("lastShownVersion", "").apply()
-                                local pluginFile = io.open(PLUGIN_PATH, "r")
-                                if pluginFile then
-                                    pluginFile:close()
-                                    local func, err = loadfile(PLUGIN_PATH)
-                                    if func then
-                                        pcall(func)
-                                    else
-                                        Toast.makeText(service or activity, "Error reloading plugin: " .. tostring(err), Toast.LENGTH_SHORT).show()
-                                    end
-                                end
-                            end
-                        }), 2000)
-                    end)
-                    successDialog.show()
-                end
-            }))
-            return
-        else
-            updateInProgress = false
-            showUpdateErrorDialog("Update Failed", "Update failed. Please try again.")
-        end
-    end
-    
-    local updateThread = Thread(Runnable{
-        run = updateProcess
-    })
-    updateThread.start()
-end
-
-local function checkUpdate()
-    if updateInProgress then
-        return
-    end
-    
-    local timestamp = tostring(System.currentTimeMillis())
-    Http.get(VERSION_URL .. "?t=" .. timestamp, function(code, response)
-        if code == 200 and response then
-            local onlineVersion = trim(response)
-            if onlineVersion ~= CURRENT_VERSION then
-                Http.get(UPDATE_CODE_URL .. "?t=" .. timestamp, function(code2, mainCode)
-                    if code2 == 200 and mainCode and trim(mainCode) ~= "" then
-                        Handler(Looper.getMainLooper()).post(Runnable({
-                            run = function()
-                                playNotification()
-                                local updateAlertDlg = LuaDialog(service or activity)
-                                updateAlertDlg.setTitle("Update Available!")
-                                updateAlertDlg.setMessage("A new version (" .. onlineVersion .. ") is available.\nCurrent version: " .. CURRENT_VERSION .. "\n\nWould you like to update now?")
-                                updateAlertDlg.setButton("Update Now", function()
-                                    updateAlertDlg.dismiss()
-                                    Toast.makeText(service or activity, "Downloading update...", Toast.LENGTH_SHORT).show()
-                                    performUpdate(mainCode, onlineVersion)
-                                end)
-                                updateAlertDlg.setButton2("Later", function()
-                                    updateAlertDlg.dismiss()
-                                end)
-                                updateAlertDlg.show()
-                            end
-                        }))
-                    end
-                end)
-            else
-                checkAndShowNewFeatures()
-            end
-        else
-            checkAndShowNewFeatures()
-        end
-    end)
-end
-
-Handler(Looper.getMainLooper()).postDelayed(Runnable({
-    run = function()
-        checkUpdate()
-    end
-}), 3000)
+require "import" import "com.androlua.Http" import "com.androlua.LuaDialog" import "android.widget.Toast" import "android.os.Handler" import "android.os.Looper" import "java.lang.Thread" import "java.lang.Runnable" import "java.lang.System" import "java.io.File" import "android.content.Context" import "android.media.ToneGenerator" import "android.media.AudioManager" import "android.os.Vibrator" import "android.os.Build" import "android.os.VibrationEffect"  local CURRENT_VERSION = "1.0" local VERSION_URL = "https://raw.githubusercontent.com/hafizshanmemon116-cmyk/Media-Player-Pro/main/version.txt" local UPDATE_CODE_URL = "https://raw.githubusercontent.com/hafizshanmemon116-cmyk/Media-Player-Pro/main/main.lua" local PLUGIN_PATH = (function()     local src = debug.getinfo(1, "S").source     return src and src:match("^@?(.*)$") or "" end)() local updateInProgress = false  local prefs = (service or activity).getSharedPreferences("AutoUpdatePrefs", Context.MODE_PRIVATE)  local function playNotification()     pcall(function()         local tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)         tone.startTone(ToneGenerator.TONE_PROP_ACK, 100)         local vibrator = (service or activity).getSystemService(Context.VIBRATOR_SERVICE)         if vibrator then             if Build.VERSION.SDK_INT >= 26 then                 vibrator.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))             else                 vibrator.vibrate(200)             end         end     end) end  local function trim(s)     if s == nil then return "" end     return tostring(s):gsub("^%s*(.-)%s*$", "%1") end  local function showUpdateErrorDialog(title, message)     Handler(Looper.getMainLooper()).post(Runnable({         run = function()             local errorDialog = LuaDialog(service or activity)             errorDialog.setTitle(title)             errorDialog.setMessage(message)             errorDialog.setButton("OK", function()                 errorDialog.dismiss()             end)             errorDialog.show()         end     })) end  local function checkAndShowNewFeatures()     local lastShown = prefs.getString("lastShownVersion", "")     if lastShown ~= CURRENT_VERSION then         Handler(Looper.getMainLooper()).post(Runnable{             run=function()                 playNotification()                 local featuresDialog = LuaDialog(service or activity)                 featuresDialog.setTitle("New Update Details")                 featuresDialog.setMessage("Testing")                 featuresDialog.setButton("OK", function()                      featuresDialog.dismiss()                  end)                 featuresDialog.show()                 prefs.edit().putString("lastShownVersion", CURRENT_VERSION).apply()             end         })     end end  local function performUpdate(mainCode, onlineVersion)     if not mainCode or trim(mainCode) == "" then         showUpdateErrorDialog("Update Failed", "Main plugin code is empty.")         return     end          updateInProgress = true          local function updateProcess()         local currentFileSrc = debug.getinfo(1, "S").source         local currentFilePath = currentFileSrc and currentFileSrc:match("^@?(.*)$") or ""                  if currentFilePath ~= "" and currentFilePath ~= PLUGIN_PATH then             pcall(function()                 os.rename(currentFilePath, PLUGIN_PATH)             end)         end                  local success = false         local tempPath = PLUGIN_PATH .. ".temp_update"         local f = io.open(tempPath, "w")         if f then             f:write(mainCode)             f:close()                          local fileExists = io.open(PLUGIN_PATH, "r")             if fileExists then                 fileExists:close()                 local delSuccess = pcall(function()                     os.remove(PLUGIN_PATH)                 end)                 if delSuccess then                     local renameSuccess = pcall(function()                         os.rename(tempPath, PLUGIN_PATH)                     end)                     if renameSuccess then                         success = true                     end                 end             else                 local renameSuccess = pcall(function()                     os.rename(tempPath, PLUGIN_PATH)                 end)                 if renameSuccess then                     success = true                 end             end                          if not success then                 pcall(function() os.remove(tempPath) end)             end         end                  if success then             updateInProgress = false             Handler(Looper.getMainLooper()).post(Runnable({                 run = function()                     playNotification()                     local successDialog = LuaDialog(service or activity)                     successDialog.setTitle("Update Successful")                     successDialog.setMessage("Successfully updated to the latest version.\n\nClick OK to restart and apply the update.")                     successDialog.setButton("OK", function()                         successDialog.dismiss()                                                  Handler(Looper.getMainLooper()).post(Runnable({                             run = function()                                 pcall(function() if _G.mainDialog then _G.mainDialog.dismiss() _G.mainDialog = nil end end)                                 pcall(function() if _G.mainDlg then _G.mainDlg.dismiss() _G.mainDlg = nil end end)                                 pcall(function() if _G.allDialogBox then _G.allDialogBox.dismiss() _G.allDialogBox = nil end end)                                 pcall(function() if _G.alertDialogBox then _G.alertDialogBox.dismiss() _G.alertDialogBox = nil end end)                                                                  pcall(function() if _G.dismissAllDialogs then _G.dismissAllDialogs() end end)                                 pcall(function() if _G.dismissAll then _G.dismissAll() end end)                                 pcall(function() if _G.dismiss then _G.dismiss() end end)                                 pcall(function() if dismissAllDialogs then dismissAllDialogs() end end)                                 pcall(function() if dismissAll then dismissAll() end end)                                  pcall(function()                                     if activity then                                         activity.finish()                                     end                                 end)                             end                         }))                                                  Handler(Looper.getMainLooper()).postDelayed(Runnable({                             run = function()                                 prefs.edit().putString("lastShownVersion", "").apply()                                 local pluginFile = io.open(PLUGIN_PATH, "r")                                 if pluginFile then                                     pluginFile:close()                                     local func, err = loadfile(PLUGIN_PATH)                                     if func then                                         pcall(func)                                     else                                         Toast.makeText(service or activity, "Error reloading plugin: " .. tostring(err), Toast.LENGTH_SHORT).show()                                     end                                 end                             end                         }), 2000)                     end)                     successDialog.show()                 end             }))             return         else             updateInProgress = false             showUpdateErrorDialog("Update Failed", "Update failed. Please try again.")         end     end          local updateThread = Thread(Runnable{         run = updateProcess     })     updateThread.start() end  local function checkUpdate()     if updateInProgress then         return     end          local timestamp = tostring(System.currentTimeMillis())     Http.get(VERSION_URL .. "?t=" .. timestamp, function(code, response)         if code == 200 and response then             local onlineVersion = trim(response)             if onlineVersion ~= CURRENT_VERSION then                 Http.get(UPDATE_CODE_URL .. "?t=" .. timestamp, function(code2, mainCode)                     if code2 == 200 and mainCode and trim(mainCode) ~= "" then                         Handler(Looper.getMainLooper()).post(Runnable({                             run = function()                                 playNotification()                                 local updateAlertDlg = LuaDialog(service or activity)                                 updateAlertDlg.setTitle("Update Available!")                                 updateAlertDlg.setMessage("A new version (" .. onlineVersion .. ") is available.\nCurrent version: " .. CURRENT_VERSION .. "\n\nWould you like to update now?")                                 updateAlertDlg.setButton("Update Now", function()                                     updateAlertDlg.dismiss()                                     Toast.makeText(service or activity, "Downloading update...", Toast.LENGTH_SHORT).show()                                     performUpdate(mainCode, onlineVersion)                                 end)                                 updateAlertDlg.setButton2("Later", function()                                     updateAlertDlg.dismiss()                                 end)                                 updateAlertDlg.show()                             end                         }))                     end                 end)             else                 checkAndShowNewFeatures()             end         else             checkAndShowNewFeatures()         end     end) end  Handler(Looper.getMainLooper()).postDelayed(Runnable({     run = function()         checkUpdate()     end }), 3000) 
